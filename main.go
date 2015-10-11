@@ -1,13 +1,13 @@
 package main
 
 import (
-	"compress/gzip"
-	"net/http"
-	"log"
-	"io/ioutil"
-	"strings"
 	"bytes"
+	"compress/gzip"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"regexp"
+	"strings"
 )
 
 func IsHTTPSPath(path string) bool {
@@ -18,7 +18,7 @@ func IsHTTPSPath(path string) bool {
 	}
 }
 
-func ReplaceParasoupWithSoupHost(s  string, path string) string {
+func ReplaceParasoupWithSoupHost(s string, path string) string {
 	if IsHTTPSPath(path) {
 		r := regexp.MustCompile("http://([^ ]*)parasoup.de:8080")
 		s = r.ReplaceAllString(s, "http://${1}soup.io")
@@ -26,7 +26,7 @@ func ReplaceParasoupWithSoupHost(s  string, path string) string {
 	return strings.Replace(s, "parasoup.de:8080", "soup.io", -1)
 }
 
-func ReplaceSoupWithParasoupData(s  string, path string) string {
+func ReplaceSoupWithParasoupData(s string, path string) string {
 	r := regexp.MustCompile("https?://([^ ]*)soup.io")
 	r2 := regexp.MustCompile("([^ ]*)soup.io")
 	s = r.ReplaceAllString(s, "http://${1}parasoup.de:8080")
@@ -83,7 +83,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newRequestUrl := ReplaceParasoupWithSoupHost(GetSchemeForPath(r.URL.Path) + r.Host + r.URL.String(), r.URL.Path)
+	newRequestUrl := ReplaceParasoupWithSoupHost(GetSchemeForPath(r.URL.Path)+r.Host+r.URL.String(), r.URL.Path)
 	soupRequest, err := http.NewRequest(r.Method, newRequestUrl, bytes.NewReader(originalRequestData))
 
 	if err != nil {
@@ -94,8 +94,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Filling soupRequest")
 	soupRequest.Header = ConvertHeaderForRequest(r.Header, r.URL.Path)
 
-	log.Println("Original:",r.Method, r.Host + r.URL.String(), r.Header)
-	log.Println("Soup Request:",r.Method, newRequestUrl, soupRequest.Header)
+	log.Println("Original:", r.Method, r.Host+r.URL.String(), r.Header)
+	log.Println("Soup Request:", r.Method, newRequestUrl, soupRequest.Header)
 	response, err := http.DefaultTransport.RoundTrip(soupRequest)
 
 	if err != nil {
@@ -127,7 +127,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	for key, vals := range ConvertHeaderForResponse(response.Header, r.URL.Path) {
 		if key != "Content-Length" {
-		    w.Header()[key] = vals
+			w.Header()[key] = vals
 		}
 	}
 	log.Println("Parasoup Response:", w.Header())

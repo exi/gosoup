@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"code.google.com/p/go-uuid/uuid"
 	"compress/gzip"
 	"fmt"
 	"github.com/Unknwon/goconfig"
+	"github.com/boltdb/bolt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -14,9 +16,20 @@ import (
 	"strings"
 )
 
+var authBucket = []byte("auth")
+var newBucket = []byte("new")
+var servedBucket = []byte("served")
+var cacheBucket = []byte("cache")
+
+const cookieName string = "parasoup-auth"
+
 type Config struct {
-	domain, port, dataPath string
+	domain, port, listenPort, dataPath, username, password string
+	db                                                     *bolt.DB
 }
+
+type Handler func(w http.ResponseWriter, r *http.Request, config Config)
+type HandlerWrapper func(next Handler, w http.ResponseWriter, r *http.Request, config Config)
 
 func IsHTTPSPath(path string) bool {
 	if path == "/login" {
@@ -109,6 +122,9 @@ func SendTextResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.R
 
 	for key, vals := range ConvertHeaderForResponse(soupResponse.Header, path, config) {
 		if key != "Content-Length" {
+			if prev, ok := w.Header()[key]; ok {
+				vals = append(vals, prev...)
+			}
 			w.Header()[key] = vals
 		}
 	}
@@ -155,7 +171,7 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 	var targetWriter io.Writer
 	targetWriter = w
 
-	if IsSaveableType(soupResponse.Header.Get("Content-Type")) {
+	if IsSaveableType(soupResponse.Header.Get("Content-Type")) && soupResponse.StatusCode == 200 {
 		targetFile, err := os.Create(FileNameForPath(path, config))
 		if err != nil {
 			panic(err)
@@ -246,34 +262,143 @@ func handler(w http.ResponseWriter, r *http.Request, config Config) {
 	log.Println("Request done")
 }
 
-func main() {
-	configFile := os.Args[1]
+func CookieValid(cookie string, config Config) bool {
+	cookieValid := false
+	err := config.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(authBucket)
+		v := b.Get([]byte(cookie))
+		cookieValid = v != nil
+		return nil
+	})
+	return err == nil && cookieValid
+}
 
-	cfg, err := goconfig.LoadConfigFile(configFile)
+func WrapAuth(next Handler, w http.ResponseWriter, r *http.Request, config Config) {
+	authenticated := false
+	if cookie, err := r.Cookie(cookieName); err == nil && CookieValid(cookie.Value, config) {
+		authenticated = true
+	}
+
+	if user, password, ok := r.BasicAuth(); ok && user == config.username && password == config.password {
+		newUUID := uuid.NewRandom().String()
+		err := config.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(authBucket)
+			err := b.Put([]byte(newUUID), []byte("ok"))
+			return err
+		})
+
+		if err != nil {
+			panic(err)
+		}
+
+		newCookie := new(http.Cookie)
+		newCookie.Name = cookieName
+		newCookie.Value = newUUID
+		newCookie.Domain = "parasoup.de"
+		newCookie.MaxAge = 60 * 60 * 24 * 365
+
+		http.SetCookie(w, newCookie)
+		authenticated = true
+	}
+
+	if authenticated {
+		next(w, r, config)
+	} else {
+		w.Header()["WWW-Authenticate"] = []string{"Basic realm=\"parasoup\""}
+		w.WriteHeader(401)
+	}
+}
+
+func ReadConfig(fileName string) Config {
+	cfg, err := goconfig.LoadConfigFile(fileName)
 	if err != nil {
-		panic("Config file was not read")
+		panic(err)
 	}
 
 	domain, err := cfg.GetValue("http", "domain")
 	if err != nil {
-		panic("Could not get domain from config")
+		panic(err)
 	}
 
 	port, err := cfg.GetValue("http", "port")
 	if err != nil {
-		panic("Could not get port from config")
+		panic(err)
+	}
+
+	listenPort, err := cfg.GetValue("http", "listenPort")
+	if err != nil {
+		panic(err)
 	}
 
 	dataPath, err := cfg.GetValue("storage", "dataPath")
 	if err != nil {
-		panic("Could not get dataPath from config")
+		panic(err)
 	}
 
-	config := Config{domain: domain, port: port, dataPath: dataPath}
+	username, err := cfg.GetValue("http", "username")
+	if err != nil {
+		panic(err)
+	}
 
-	log.Println("Startup for " + domain + ":" + port)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r, config)
+	password, err := cfg.GetValue("http", "password")
+	if err != nil {
+		panic(err)
+	}
+
+	return Config{
+		domain:     domain,
+		port:       port,
+		listenPort: listenPort,
+		username:   username,
+		password:   password,
+		dataPath:   dataPath}
+
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		panic("No config file given")
+	}
+
+	configFile := os.Args[1]
+
+	db, err := bolt.Open("gosoup.db", 0600, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	defer db.Close()
+
+	db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(authBucket)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = tx.CreateBucketIfNotExists(servedBucket)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = tx.CreateBucketIfNotExists(newBucket)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = tx.CreateBucketIfNotExists(cacheBucket)
+		if err != nil {
+			panic(err)
+		}
+		return nil
 	})
-	http.ListenAndServe(":"+port, nil)
+
+	config := ReadConfig(configFile)
+
+	config.db = db
+
+	log.Println("Startup for " + config.domain + ":" + config.port + " on port " + config.listenPort)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		WrapAuth(handler, w, r, config)
+	})
+	http.ListenAndServe(":"+config.listenPort, nil)
 }

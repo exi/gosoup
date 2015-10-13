@@ -131,6 +131,7 @@ func IsSaveableType(contentType string) bool {
 	commits := map[string]bool{
 		"image/jpeg": true,
 		"image/png":  true,
+		"image/gif":  true,
 	}
 	_, ok := commits[contentType]
 	return ok

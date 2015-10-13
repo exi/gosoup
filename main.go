@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"github.com/Unknwon/goconfig"
 	"io"
 	"io/ioutil"
@@ -14,7 +15,7 @@ import (
 )
 
 type Config struct {
-	domain, port string
+	domain, port, dataPath string
 }
 
 func IsHTTPSPath(path string) bool {
@@ -125,6 +126,22 @@ func SendTextResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.R
 	}
 }
 
+func IsSaveableType(contentType string) bool {
+	log.Println("Type:" + contentType)
+	commits := map[string]bool{
+		"image/jpeg": true,
+		"image/png":  true,
+	}
+	_, ok := commits[contentType]
+	return ok
+}
+
+func FileNameForPath(path string, config Config) string {
+	path = strings.Replace(path, "/", "", -1)
+	path = strings.Replace(path, ".", "", -1)
+	return config.dataPath + "/" + path
+}
+
 func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.Response, path string, config Config) {
 	for key, vals := range ConvertHeaderForResponse(soupResponse.Header, path, config) {
 		w.Header()[key] = vals
@@ -134,12 +151,23 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 
 	w.WriteHeader(soupResponse.StatusCode)
 
+	var targetWriter io.Writer
+	targetWriter = w
+
+	if IsSaveableType(soupResponse.Header.Get("Content-Type")) {
+		targetFile, err := os.Create(FileNameForPath(path, config))
+		if err != nil {
+			panic(err)
+		}
+		targetWriter = io.MultiWriter(w, targetFile)
+	}
+
 	if soupResponse.Header.Get("Content-Encoding") == "gzip" {
-		gw := gzip.NewWriter(w)
+		gw := gzip.NewWriter(targetWriter)
 		io.Copy(gw, soupResponse.Body)
 		gw.Flush()
 	} else {
-		io.Copy(w, soupResponse.Body)
+		io.Copy(targetWriter, soupResponse.Body)
 	}
 }
 
@@ -153,6 +181,22 @@ func handler(w http.ResponseWriter, r *http.Request, config Config) {
 
 	if err != nil {
 		log.Println("Read error", err)
+		return
+	}
+
+	cachedFileName := FileNameForPath(r.URL.Path, config)
+	stat, err := os.Stat(cachedFileName)
+	if err == nil && stat.Size() == 0 {
+		log.Println("Removing zero size file:" + cachedFileName)
+		os.Remove(cachedFileName)
+	} else if err == nil && !stat.IsDir() {
+		log.Println("Read cached file:" + cachedFileName)
+		w.Header()["Content-Length"] = []string{fmt.Sprintf("%d", stat.Size())}
+		reader, err := os.Open(cachedFileName)
+		if err != nil {
+			panic("Error reading file:" + cachedFileName)
+		}
+		io.Copy(w, reader)
 		return
 	}
 
@@ -219,7 +263,12 @@ func main() {
 		panic("Could not get port from config")
 	}
 
-	config := Config{domain: domain, port: port}
+	dataPath, err := cfg.GetValue("storage", "dataPath")
+	if err != nil {
+		panic("Could not get dataPath from config")
+	}
+
+	config := Config{domain: domain, port: port, dataPath: dataPath}
 
 	log.Println("Startup for " + domain + ":" + port)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

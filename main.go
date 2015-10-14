@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"code.google.com/p/go-uuid/uuid"
 	"compress/gzip"
+	"crypto/md5"
 	"fmt"
 	"github.com/Unknwon/goconfig"
 	"github.com/boltdb/bolt"
@@ -28,8 +29,8 @@ type Config struct {
 	db                                                     *bolt.DB
 }
 
-type Handler func(w http.ResponseWriter, r *http.Request, config Config)
-type HandlerWrapper func(next Handler, w http.ResponseWriter, r *http.Request, config Config)
+type Handler func(w http.ResponseWriter, r *http.Request)
+type HandlerWrapper func(next Handler) Handler
 
 func IsHTTPSPath(path string) bool {
 	if path == "/login" {
@@ -41,11 +42,18 @@ func IsHTTPSPath(path string) bool {
 
 func GetReplacementString(config Config) string {
 	replaceString := config.domain
+
 	if config.port != "80" {
 		replaceString = replaceString + ":" + config.port
 	}
 
 	return replaceString
+}
+
+func IsAssetHost(host string, config Config) bool {
+	replaceString := GetReplacementString(config)
+	r := regexp.MustCompile("asset-[^.]." + replaceString)
+	return r.MatchString(host)
 }
 
 func ReplaceParasoupWithSoupHost(s string, path string, config Config) string {
@@ -143,7 +151,6 @@ func SendTextResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.R
 }
 
 func IsSaveableType(contentType string) bool {
-	log.Println("Type:" + contentType)
 	commits := map[string]bool{
 		"image/jpeg": true,
 		"image/png":  true,
@@ -159,6 +166,12 @@ func FileNameForPath(path string, config Config) string {
 	return config.dataPath + "/" + path
 }
 
+func AttachEtag(w http.ResponseWriter, path string) {
+	etag := fmt.Sprintf("\"%x\"", md5.Sum([]byte(path)))
+	log.Println("etag:" + etag)
+	w.Header()["ETag"] = []string{etag}
+}
+
 func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.Response, path string, config Config) {
 	for key, vals := range ConvertHeaderForResponse(soupResponse.Header, path, config) {
 		w.Header()[key] = vals
@@ -167,6 +180,7 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 	log.Println("Parasoup Response:", w.Header())
 
 	w.WriteHeader(soupResponse.StatusCode)
+	AttachEtag(w, path)
 
 	var targetWriter io.Writer
 	targetWriter = w
@@ -188,78 +202,60 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 	}
 }
 
-func handler(w http.ResponseWriter, r *http.Request, config Config) {
-	log.Println("Handler")
-	log.Println("Path: ", r.Host)
+func handler(config Config) Handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Handler")
+		log.Println("Path: ", r.Host)
 
-	defer r.Body.Close()
-	log.Println("Reading request")
-	originalRequestData, err := ioutil.ReadAll(r.Body)
+		defer r.Body.Close()
+		originalRequestData, err := ioutil.ReadAll(r.Body)
 
-	if err != nil {
-		log.Println("Read error", err)
-		return
-	}
-
-	cachedFileName := FileNameForPath(r.URL.Path, config)
-	stat, err := os.Stat(cachedFileName)
-	if err == nil && stat.Size() == 0 {
-		log.Println("Removing zero size file:" + cachedFileName)
-		os.Remove(cachedFileName)
-	} else if err == nil && !stat.IsDir() {
-		log.Println("Read cached file:" + cachedFileName)
-		w.Header()["Content-Length"] = []string{fmt.Sprintf("%d", stat.Size())}
-		reader, err := os.Open(cachedFileName)
 		if err != nil {
-			panic("Error reading file:" + cachedFileName)
+			panic(err)
+			return
 		}
-		io.Copy(w, reader)
-		return
-	}
 
-	newRequestUrl := ReplaceParasoupWithSoupHost(GetSchemeForPath(r.URL.Path)+r.Host+r.URL.String(), r.URL.Path, config)
-	soupRequest, err := http.NewRequest(r.Method, newRequestUrl, bytes.NewReader(originalRequestData))
+		newRequestUrl := ReplaceParasoupWithSoupHost(GetSchemeForPath(r.URL.Path)+r.Host+r.URL.String(), r.URL.Path, config)
+		soupRequest, err := http.NewRequest(r.Method, newRequestUrl, bytes.NewReader(originalRequestData))
 
-	if err != nil {
-		log.Println("Request creation error", err)
-		return
-	}
+		if err != nil {
+			panic(err)
+		}
 
-	log.Println("Filling soupRequest")
-	soupRequest.Header = ConvertHeaderForRequest(r.Header, r.URL.Path, config)
+		soupRequest.Header = ConvertHeaderForRequest(r.Header, r.URL.Path, config)
 
-	log.Println("Original:", r.Method, r.Host+r.URL.String(), r.Header)
-	log.Println("Soup Request:", r.Method, newRequestUrl, soupRequest.Header)
-	response, err := http.DefaultTransport.RoundTrip(soupRequest)
+		log.Println("Original:", r.Method, r.Host+r.URL.String())
+		log.Println("Soup Request:", r.Method, newRequestUrl)
+		response, err := http.DefaultTransport.RoundTrip(soupRequest)
 
-	if err != nil {
-		log.Println("Request error", err)
-		return
-	}
-	defer response.Body.Close()
-
-	if response.Header.Get("Content-Encoding") == "gzip" {
-		response.Body, err = gzip.NewReader(response.Body)
 		if err != nil {
 			panic(err)
 		}
 		defer response.Body.Close()
-	}
 
-	isTextType := false
-
-	if val, ok := response.Header["Content-Type"]; ok {
-		if matched, _ := regexp.MatchString("text/.*", val[0]); matched {
-			isTextType = true
+		if response.Header.Get("Content-Encoding") == "gzip" {
+			response.Body, err = gzip.NewReader(response.Body)
+			if err != nil {
+				panic(err)
+			}
+			defer response.Body.Close()
 		}
-	}
 
-	if isTextType {
-		SendTextResponseForSoupResponse(w, response, r.URL.Path, config)
-	} else {
-		SendBinaryResponseForSoupResponse(w, response, r.URL.Path, config)
+		isTextType := false
+
+		if val, ok := response.Header["Content-Type"]; ok {
+			if matched, _ := regexp.MatchString("text/.*", val[0]); matched {
+				isTextType = true
+			}
+		}
+
+		if isTextType {
+			SendTextResponseForSoupResponse(w, response, r.URL.Path, config)
+		} else {
+			SendBinaryResponseForSoupResponse(w, response, r.URL.Path, config)
+		}
+		log.Println("Request done")
 	}
-	log.Println("Request done")
 }
 
 func CookieValid(cookie string, config Config) bool {
@@ -273,39 +269,81 @@ func CookieValid(cookie string, config Config) bool {
 	return err == nil && cookieValid
 }
 
-func WrapAuth(next Handler, w http.ResponseWriter, r *http.Request, config Config) {
-	authenticated := false
-	if cookie, err := r.Cookie(cookieName); err == nil && CookieValid(cookie.Value, config) {
-		authenticated = true
-	}
+func WrapDiskCache(next Handler, config Config) Handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cachedFileName := FileNameForPath(r.URL.Path, config)
+		stat, err := os.Stat(cachedFileName)
+		if err == nil && stat.Size() == 0 {
+			log.Println("Removing zero size file:" + cachedFileName)
+			os.Remove(cachedFileName)
+		} else if err == nil && !stat.IsDir() {
+			log.Println("Read cached file:" + cachedFileName)
 
-	if user, password, ok := r.BasicAuth(); ok && user == config.username && password == config.password {
-		newUUID := uuid.NewRandom().String()
-		err := config.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(authBucket)
-			err := b.Put([]byte(newUUID), []byte("ok"))
-			return err
-		})
+			w.Header()["Content-Length"] = []string{fmt.Sprintf("%d", stat.Size())}
+			AttachEtag(w, r.URL.Path)
 
-		if err != nil {
-			panic(err)
+			reader, err := os.Open(cachedFileName)
+
+			if err != nil {
+				panic("Error reading file:" + cachedFileName)
+			}
+
+			io.Copy(w, reader)
+			return
 		}
 
-		newCookie := new(http.Cookie)
-		newCookie.Name = cookieName
-		newCookie.Value = newUUID
-		newCookie.Domain = "parasoup.de"
-		newCookie.MaxAge = 60 * 60 * 24 * 365
-
-		http.SetCookie(w, newCookie)
-		authenticated = true
+		next(w, r)
 	}
+}
 
-	if authenticated {
-		next(w, r, config)
-	} else {
-		w.Header()["WWW-Authenticate"] = []string{"Basic realm=\"parasoup\""}
-		w.WriteHeader(401)
+func WrapETagAsset(next Handler, config Config) Handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		val, ok := r.Header["If-None-Match"]
+		if IsAssetHost(r.Host, config) && ok && len(val) > 0 {
+			w.WriteHeader(304)
+		} else {
+			next(w, r)
+		}
+	}
+}
+
+func WrapAuth(next Handler, config Config) Handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authenticated := false
+
+		if cookie, err := r.Cookie(cookieName); err == nil && CookieValid(cookie.Value, config) {
+			authenticated = true
+		}
+
+		if user, password, ok := r.BasicAuth(); ok && user == config.username && password == config.password {
+			newUUID := uuid.NewRandom().String()
+			err := config.db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket(authBucket)
+				err := b.Put([]byte(newUUID), []byte("ok"))
+				return err
+			})
+
+			if err != nil {
+				panic(err)
+			}
+
+			newCookie := new(http.Cookie)
+			newCookie.Name = cookieName
+			newCookie.Value = newUUID
+			newCookie.Domain = "parasoup.de"
+			newCookie.MaxAge = 60 * 60 * 24 * 365
+			newCookie.Path = "/"
+
+			http.SetCookie(w, newCookie)
+			authenticated = true
+		}
+
+		if authenticated || IsAssetHost(r.Host, config) {
+			next(w, r)
+		} else {
+			w.Header()["WWW-Authenticate"] = []string{"Basic realm=\"parasoup\""}
+			w.WriteHeader(401)
+		}
 	}
 }
 
@@ -397,8 +435,14 @@ func main() {
 	config.db = db
 
 	log.Println("Startup for " + config.domain + ":" + config.port + " on port " + config.listenPort)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		WrapAuth(handler, w, r, config)
-	})
+	http.HandleFunc(
+		"/",
+		WrapAuth(
+			WrapETagAsset(
+				WrapDiskCache(
+					handler(config),
+					config),
+				config),
+			config))
 	http.ListenAndServe(":"+config.listenPort, nil)
 }

@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -20,7 +21,6 @@ import (
 var authBucket = []byte("auth")
 var newBucket = []byte("new")
 var servedBucket = []byte("served")
-var cacheBucket = []byte("cache")
 
 const cookieName string = "parasoup-auth"
 
@@ -187,7 +187,11 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 	targetWriter = w
 
 	shouldWriteToFile := IsSaveableType(soupResponse.Header.Get("Content-Type")) && soupResponse.StatusCode == 200
+
+	log.Println("should Write To file:" + fmt.Sprintf("%b", shouldWriteToFile))
+
 	var targetFileName string
+
 	if shouldWriteToFile {
 		targetFileName = FileNameForPath(path, config)
 		targetFile, err := os.Create(targetFileName)
@@ -208,6 +212,21 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 
 	if shouldWriteToFile && copyErr != nil {
 		os.Remove(targetFileName)
+	} else if shouldWriteToFile {
+		config.db.Update(func(tx *bolt.Tx) error {
+			servedB := tx.Bucket(servedBucket)
+			servedVal := servedB.Get([]byte(path))
+			newB := tx.Bucket(newBucket)
+			newVal := newB.Get([]byte(path))
+			if servedVal == nil && newVal == nil {
+				err := newB.Put([]byte(path), []byte(""))
+				if err != nil {
+					panic(err)
+				}
+			}
+			log.Println("Added to new:" + path)
+			return nil
+		})
 	}
 }
 
@@ -276,6 +295,79 @@ func CookieValid(cookie string, config Config) bool {
 		return nil
 	})
 	return err == nil && cookieValid
+}
+
+func WrapParasoup(next Handler, config Config) Handler {
+	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		panic(err)
+	}
+
+	server := http.FileServer(http.Dir(dir + "/static"))
+	log.Println("serving from:" + dir + "/static")
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Host == GetReplacementString(config) {
+			if r.URL.Path == "/" {
+				r.URL.Path = "/parasoup.html"
+			}
+			server.ServeHTTP(w, r)
+		} else {
+			log.Println("non static path:" + r.Host)
+			next(w, r)
+		}
+	}
+}
+
+func WrapApi(next Handler, config Config) Handler {
+	regex := regexp.MustCompile("/api/next([?#].*)?")
+	return func(w http.ResponseWriter, r *http.Request) {
+		if regex.MatchString(r.URL.Path) {
+			log.Println("serving api")
+			var servePath []byte
+			var empty bool = false
+
+			config.db.Update(func(tx *bolt.Tx) error {
+				newB := tx.Bucket(newBucket)
+
+				cursor := newB.Cursor()
+				k, _ := cursor.First()
+				if k == nil {
+					empty = true
+					return nil
+				}
+
+				servePath = make([]byte, len(k), len(k))
+				copy(servePath, k)
+
+				servedB := tx.Bucket(servedBucket)
+				err := servedB.Put(k, []byte(""))
+				if err != nil {
+					panic(err)
+				}
+
+				err = newB.Delete(k)
+				if err != nil {
+					panic(err)
+				}
+
+				return nil
+			})
+
+			if !empty {
+				w.Header()["Content-Type"] = []string{"text/plain"}
+				url := []byte("http://asset-a." + GetReplacementString(config) + string(servePath))
+				w.Header()["Content-Length"] = []string{fmt.Sprintf("%d", len(url))}
+				w.Write(url)
+				log.Println("served via api:" + string(url))
+			} else {
+				w.WriteHeader(404)
+				w.Write([]byte("Queue is empty"))
+			}
+
+		} else {
+			next(w, r)
+		}
+	}
 }
 
 func WrapDiskCache(next Handler, config Config) Handler {
@@ -403,6 +495,12 @@ func ReadConfig(fileName string) Config {
 
 }
 
+func handle404() Handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		panic("No config file given")
@@ -433,10 +531,6 @@ func main() {
 			panic(err)
 		}
 
-		_, err = tx.CreateBucketIfNotExists(cacheBucket)
-		if err != nil {
-			panic(err)
-		}
 		return nil
 	})
 
@@ -446,11 +540,18 @@ func main() {
 
 	log.Println("Startup for " + config.domain + ":" + config.port + " on port " + config.listenPort)
 	http.HandleFunc(
+		"/api/next",
+		WrapApi(handle404(), config),
+	)
+
+	http.HandleFunc(
 		"/",
 		WrapAuth(
 			WrapETagAsset(
 				WrapDiskCache(
-					handler(config),
+					WrapParasoup(
+						handler(config),
+						config),
 					config),
 				config),
 			config))

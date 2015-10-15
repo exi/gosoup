@@ -1,0 +1,310 @@
+<html>
+<head>
+    <title>Infinite pictures scolling by</title>
+    <meta name="description" content="Infinite pictures scrolling by">
+    <meta name="keywords" content="soup.io, parasoup, funny pictures, scrolling">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <link href="http://ajax.googleapis.com/ajax/libs/jqueryui/1.8/themes/base/jquery-ui.css" rel="stylesheet" type="text/css">
+    <script type="text/javascript" src="http://ajax.googleapis.com/ajax/libs/jquery/1.7.0/jquery.min.js"></script>
+    <script src="http://ajax.googleapis.com/ajax/libs/jqueryui/1.8/jquery-ui.min.js"></script>
+    <script src="/jquery.cookie.js"></script>
+    <style type="text/css">
+        #slider { width: 250px; margin-right: 10px;}
+        #toggler { width: 100%; z-index: 10; background-color: grey; }
+        #indicator { width: 100%; height: 2px; background-color: blue;}
+        #indicator2 { width: 100%; height: 2px; background-color: grey;}
+        .paused { background-color: red !important; }
+        #effect { height: 120px; width: 100%; overflow: hidden; position: absolute; background-color: white; border-bottom: 2px solid grey; }
+        #effect.closed { height: 0px; }
+        #effect h3 { margin: 0; padding: 5px; text-align: center; }
+    </style>
+</head>
+<body style="margin: 0;">
+<div id="toggler">
+<div id="indicator"> </div>
+<div id="indicator2"> </div>
+<div id="effect">
+    <h3 class="ui-widget-header ui-corner-all">Parasoup</h3>
+    <p>
+    <div id="slider"></div>
+    picture delay: <span id="delay"></span>. Pause with any key. Click image for search, <a href="http://www.parasoup.de">click here for soup</a>. <u><span id="paused">unpaused</span></u>.
+    here for: <span id="time"></span>, watched <span id="items"></span> pictures. You can trigger "next Image" with j, l, left/down arrow, even in paused mode.
+    </p>
+    <p>All images taken from <a href="http://www.soup.io">soup.io</a> and cached for faster access.</p>
+</div>
+</div>
+<a href="https://github.com/exi/soupcache"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_orange_ff7600.png" alt="Fork me on GitHub"></a>
+<div id="container"></div>
+<script type="text/javascript">
+    function setCookie(key, value) {
+        $.cookie(key, value, {expires: 9999});
+    }
+
+    var Cache = function() {
+        this.name = "default";
+        this.constructor = function(cacheSize) {
+            this._cacheSize = cacheSize || 20;
+            this._store = [];
+            this._requestInProgress = false;
+            this.update();
+        }
+    };
+    Cache.prototype.update = function() {
+        if (this._store.length < this._cacheSize) {
+            this._fetch();
+        }
+    };
+    Cache.prototype._fetch = function() {
+        if (this._requestInProgress === false) {
+            this._requestInProgress = true;
+            this.fetch();
+        }
+    };
+    Cache.prototype._fetchDone = function() {
+        this._requestInProgress = false;
+        this.update();
+    };
+    Cache.prototype.add = function(item) {
+        this._store.push(item);
+    }
+    Cache.prototype.fillStatus = function() {
+        return this.length() / this._cacheSize;
+    }
+    Cache.prototype.fetch = function() {};
+    Cache.prototype.get = function() {
+        if (this._store.length > 0) {
+            var ret = this._store.shift();
+            this.update();
+            return ret;
+        } else {
+            return null;
+        }
+    };
+    Cache.prototype.length = function() {
+        return this._store.length;
+    };
+
+    var UrlCache = function() {
+        this.name = "url";
+        this.fetch = function() {
+            var that = this;
+            $.ajax({
+                url: "http://" + window.location.host + "/api/next?",
+                success: function(data, textStatus, xhr) {
+                    if (xhr.status == 200) {
+                        that.add(data);
+                        that._fetchDone();
+                    }
+                },
+                error: function(xhr, ajaxOptions, thrownError) {
+                    console.error(xhr);
+                    console.error(thrownError);
+                    setTimeout(function() {that.fetch()}, 1000);
+                }
+            });
+        }
+    }
+
+    UrlCache.prototype = new Cache();
+
+    var ImgCache = function() {
+        this.name = "img";
+        this.urlCache = new UrlCache();
+        this.urlCache.constructor();
+        this.fetch = function() {
+            var that = this;
+            var retry = function() {
+                setTimeout(function() {that.fetch();}, 1000);
+            }
+            var url = this.urlCache.get();
+            if (url !== null) {
+                $("<img />").
+                    attr("src", url).
+                    load(function() {
+                        $(this).hide().css('float', 'left');
+                        var a = $("<a />").
+                            attr("href", url.replace(/[a-zA-Z0-9\-]*\.parasoup\.de/g, "whatthepost.parasoup.de")).
+                            attr("target", "_blank").
+                            prepend(this);
+                        that.add(a);
+                        that._fetchDone();
+                        that.updateIndicator();
+                    }).
+                    error(function() {
+                        $(this).remove();
+                        retry();
+                    });
+            } else {
+                retry();
+            }
+        };
+        this.update = function() {
+            this.updateIndicator();
+            Cache.prototype.update.call(this);
+        };
+        this.updateIndicator = function() {
+            $("#indicator").css("width", this.fillStatus() * 100 + "%");
+        };
+    }
+
+    ImgCache.prototype = new Cache();
+
+    var imgCache = new ImgCache();
+    imgCache.constructor();
+
+    var timer = null;
+    var paused = false;
+    var nodes = [];
+    var maxEntries = 15;
+    var items = 0;
+    var delay = $.cookie("parasoup_delay") || 2000;
+
+    var continueLoop = function() {
+        timer = setTimeout(loop, delay);
+    }
+
+    var getImgFromA = function(a) { return $(a).children(":first"); };
+
+    var showImage = function(img) {
+        img.slideDown(500, function() {
+            items++;
+            if (!paused) continueLoop();
+        });
+    }
+
+    var loop = function() {
+        if (!paused) {
+            showNextImage();
+        }
+    }
+
+    var showNextImage = function() {
+        while (nodes.length > maxEntries) {
+            $(nodes[0]).remove();
+            nodes.splice(0, 1);
+        }
+
+        var a = imgCache.get();
+        if (a !== null) {
+            var img = getImgFromA(a);
+            $('#container').prepend(a);
+            nodes.push($(a));
+            showImage($(img));
+        } else if (!paused) {
+            continueLoop();
+        }
+    }
+
+    var invalidKeys = [17/*ctrl*/, 18/*tab*/, 91/*win*/, 32, 33, 34, 35, 36, 38, 144];
+    var nextKeys = [39/*right*/, 40/*down*/, 74/*j*/, 76/*l*/];
+    for (var i = 112; i <= 123; i++) {
+        invalidKeys.push(i);
+    }
+
+    var keyEvents = function() {
+        var keyHandler = function(evt) {
+            var key = evt.which || evt.keyCode;
+            if (invalidKeys.indexOf(key) === -1) {
+                console.log(key);
+                if (nextKeys.indexOf(key) !== -1) {
+                    showNextImage();
+                } else if (paused) {
+                    paused = false;
+                    loop();
+                    $('#paused').text("unpaused");
+                    $('#indicator2').removeClass("paused", 250);
+                } else {
+                    paused = true;
+                    if (timer) clearTimeout(timer);
+                    timer = null;
+                    $('#paused').text("paused");
+                    $('#indicator2').addClass("paused", 250);
+                }
+            }
+        }
+        $(document).keydown(keyHandler);
+    }
+
+    var printStatus = function() {
+        var start = new Date();
+        var timeNode = $('#time');
+        var itemNode = $('#items');
+        setInterval(function() {
+            var diff = ((new Date()) - start) / 1000;
+            var hours = 0,
+                minutes = 0,
+                seconds = 0;
+            hours = Math.floor(diff/(60*60));
+            diff %= (60*60);
+            minutes = Math.floor(diff/60);
+            diff %= (60);
+            seconds = Math.floor(diff);
+
+            var text = "";
+            if (hours > 0) text += hours + " hours ";
+            if (minutes > 0 || hours > 0) text += minutes + " minutes ";
+            if (seconds > 0 || minutes > 0 || hours > 0) text += seconds + " seconds";
+
+            timeNode.text(text);
+
+            itemNode.text(items);
+
+            document.title = "parasoup.de: " + text + ", " + items + " pictures";
+        }, 1000);
+    }
+
+    var updateDelay = function() {
+        $("#delay").text(delay+ "ms")
+        setCookie("parasoup_delay", delay);
+    }
+
+    $(function() {
+        $("#slider").slider({
+            value: 2000,
+            min: 1000,
+            max: 10000,
+            slide: function(event, ui) {
+                delay = ui.value;
+                updateDelay();
+            }
+        });
+        updateDelay();
+        loop();
+        keyEvents();
+        printStatus();
+        var hideTimer = null;
+        var showing = false;
+        var clearTimer = function() {
+            clearTimeout(hideTimer);
+            hideTimer = null;
+        };
+        $("#toggler").mouseenter(function(event) {
+            clearTimer();
+            if (!showing) {
+                showing = true;
+                $("#effect").removeClass("closed", 500, function() {
+                    showing = false;
+                });
+            }
+            event.stopPropagation();
+        });
+        $("#effect").mouseover(function(event) {
+            clearTimer();
+            event.stopPropagation();
+        });
+        var setHideTimer = function() {
+            clearTimer();
+            hideTimer = setTimeout(function() {
+                $("#effect").addClass("closed", 500);
+            }, 1000);
+        };
+        $("body").mouseover(function() {
+            if (hideTimer === null) {
+                setHideTimer();
+            }
+        });
+        setHideTimer();
+    });
+</script>
+</body>
+</html>

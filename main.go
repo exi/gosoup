@@ -170,6 +170,7 @@ func AttachEtag(w http.ResponseWriter, path string) {
 	etag := fmt.Sprintf("\"%x\"", md5.Sum([]byte(path)))
 	log.Println("etag:" + etag)
 	w.Header()["ETag"] = []string{etag}
+	w.Header()["Cache-Control"] = []string{fmt.Sprintf("max-age=%d", 60*60*24*365)}
 }
 
 func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http.Response, path string, config Config) {
@@ -185,20 +186,28 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 	var targetWriter io.Writer
 	targetWriter = w
 
-	if IsSaveableType(soupResponse.Header.Get("Content-Type")) && soupResponse.StatusCode == 200 {
-		targetFile, err := os.Create(FileNameForPath(path, config))
+	shouldWriteToFile := IsSaveableType(soupResponse.Header.Get("Content-Type")) && soupResponse.StatusCode == 200
+	var targetFileName string
+	if shouldWriteToFile {
+		targetFileName = FileNameForPath(path, config)
+		targetFile, err := os.Create(targetFileName)
 		if err != nil {
 			panic(err)
 		}
 		targetWriter = io.MultiWriter(w, targetFile)
 	}
 
+	var copyErr error
 	if soupResponse.Header.Get("Content-Encoding") == "gzip" {
 		gw := gzip.NewWriter(targetWriter)
-		io.Copy(gw, soupResponse.Body)
+		_, copyErr = io.Copy(gw, soupResponse.Body)
 		gw.Flush()
 	} else {
-		io.Copy(targetWriter, soupResponse.Body)
+		_, copyErr = io.Copy(targetWriter, soupResponse.Body)
+	}
+
+	if shouldWriteToFile && copyErr != nil {
+		os.Remove(targetFileName)
 	}
 }
 
@@ -300,6 +309,7 @@ func WrapETagAsset(next Handler, config Config) Handler {
 	return func(w http.ResponseWriter, r *http.Request) {
 		val, ok := r.Header["If-None-Match"]
 		if IsAssetHost(r.Host, config) && ok && len(val) > 0 {
+			w.Header()["Cache-Control"] = []string{fmt.Sprintf("max-age=%d", 60*60*24*365)}
 			w.WriteHeader(304)
 		} else {
 			next(w, r)

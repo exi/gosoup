@@ -198,6 +198,8 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 		if err != nil {
 			panic(err)
 		}
+
+		defer targetFile.Close()
 		targetWriter = io.MultiWriter(w, targetFile)
 	}
 
@@ -384,10 +386,11 @@ func WrapDiskCache(next Handler, config Config) Handler {
 			AttachEtag(w, r.URL.Path)
 
 			reader, err := os.Open(cachedFileName)
-
 			if err != nil {
 				panic("Error reading file:" + cachedFileName)
 			}
+
+			defer reader.Close()
 
 			io.Copy(w, reader)
 			return

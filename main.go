@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/Unknwon/goconfig"
 	"github.com/boltdb/bolt"
+	"github.com/gorilla/handlers"
 	"io"
 	"io/ioutil"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var authBucket = []byte("auth")
@@ -220,13 +222,13 @@ func SendBinaryResponseForSoupResponse(w http.ResponseWriter, soupResponse *http
 			servedVal := servedB.Get([]byte(path))
 			newB := tx.Bucket(newBucket)
 			newVal := newB.Get([]byte(path))
-			if servedVal == nil && newVal == nil {
+			if servedVal == nil && newVal == nil && soupResponse.ContentLength > 50*1024 {
 				err := newB.Put([]byte(path), []byte(""))
 				if err != nil {
 					panic(err)
 				}
+				log.Println("Added to new:" + path)
 			}
-			log.Println("Added to new:" + path)
 			return nil
 		})
 	}
@@ -320,41 +322,96 @@ func WrapParasoup(next Handler, config Config) Handler {
 	}
 }
 
+func GetNextImagePath(config Config) ([]byte, bool) {
+	var servePath []byte
+	var empty bool = false
+
+	config.db.Update(func(tx *bolt.Tx) error {
+		newB := tx.Bucket(newBucket)
+
+		cursor := newB.Cursor()
+		k, _ := cursor.First()
+		if k == nil {
+			empty = true
+			return nil
+		}
+
+		servePath = make([]byte, len(k), len(k))
+		copy(servePath, k)
+
+		servedB := tx.Bucket(servedBucket)
+		err := servedB.Put(k, []byte(""))
+		if err != nil {
+			panic(err)
+		}
+
+		err = newB.Delete(k)
+		if err != nil {
+			panic(err)
+		}
+
+		return nil
+	})
+
+	return servePath, empty
+}
+
+func GetNextImageChannel(config Config) chan []byte {
+
+}
+
 func WrapApi(next Handler, config Config) Handler {
 	regex := regexp.MustCompile("/api/next([?#].*)?")
+	ch := make(chan []byte)
+	go func() {
+		first := true
+		var lastPath []byte
+		last := time.Now()
+
+		for {
+			if time.Since(last).Seconds() > 0.7 || first {
+				for {
+					newPath, empty := GetNextImagePath(config)
+					if empty {
+						time.Sleep(1 * time.Second)
+					} else {
+						lastPath = make([]byte, len(newPath))
+						copy(lastPath, newPath)
+						first = false
+						last = time.Now()
+						break
+					}
+				}
+			}
+			ch <- lastPath
+		}
+	}()
+
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			w.Header()["Access-Control-Allow-Origin"] = []string{"*"}
+			w.WriteHeader(200)
+			return
+		}
 		if regex.MatchString(r.URL.Path) {
 			log.Println("serving api")
+
+			timeout := make(chan bool, 1)
+			go func() {
+				time.Sleep(1 * time.Second)
+				timeout <- true
+			}()
+
 			var servePath []byte
-			var empty bool = false
+			empty := false
 
-			config.db.Update(func(tx *bolt.Tx) error {
-				newB := tx.Bucket(newBucket)
+			select {
+			case servePath = <-ch:
+			case <-timeout:
+				empty = true
+			}
 
-				cursor := newB.Cursor()
-				k, _ := cursor.First()
-				if k == nil {
-					empty = true
-					return nil
-				}
-
-				servePath = make([]byte, len(k), len(k))
-				copy(servePath, k)
-
-				servedB := tx.Bucket(servedBucket)
-				err := servedB.Put(k, []byte(""))
-				if err != nil {
-					panic(err)
-				}
-
-				err = newB.Delete(k)
-				if err != nil {
-					panic(err)
-				}
-
-				return nil
-			})
-
+			w.Header()["Access-Control-Allow-Origin"] = []string{"*"}
 			if !empty {
 				w.Header()["Content-Type"] = []string{"text/plain"}
 				url := []byte("http://asset-a." + GetReplacementString(config) + string(servePath))
@@ -542,12 +599,15 @@ func main() {
 	config.db = db
 
 	log.Println("Startup for " + config.domain + ":" + config.port + " on port " + config.listenPort)
-	http.HandleFunc(
+
+	r := http.NewServeMux()
+
+	r.HandleFunc(
 		"/api/next",
 		WrapApi(handle404(), config),
 	)
 
-	http.HandleFunc(
+	r.HandleFunc(
 		"/",
 		WrapAuth(
 			WrapETagAsset(
@@ -558,5 +618,5 @@ func main() {
 					config),
 				config),
 			config))
-	http.ListenAndServe(":"+config.listenPort, nil)
+	http.ListenAndServe(":"+config.listenPort, handlers.LoggingHandler(os.Stdout, r))
 }
